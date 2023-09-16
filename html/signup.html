@@ -1,0 +1,26 @@
+<html>
+<head>
+  <title>Sign up to chat</title>
+</head>
+
+<body>
+<div style="text-align: center;">
+  <h3>Sign up to chat</h3>
+  <form action="/create" method="POST" id="form">
+    <input placeholder="user" id="user" type="text">
+    <input placeholder="password" id="password" type="password">
+    <input type="submit" value="Sign up" />
+  </form>
+  <button id="signin">Sign in</button>
+</div>
+
+<script>
+  var signinButton = document.getElementById("signin");
+
+  signinButton.onclick = function () {
+    window.location = "/signin";
+  };
+
+</script>
+</body>
+</html>

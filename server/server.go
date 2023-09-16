@@ -1,29 +1,35 @@
 package server
 
 import (
-	"context"
-	"github.com/gin-gonic/gin"
+	"errors"
+	"fmt"
 	"github.com/olahol/melody"
 	"github.com/rabbitmq/amqp091-go"
 	"log"
 	"net/http"
-	"regexp"
+	"reimagined-chainsaw/adapter/manager"
+	"reimagined-chainsaw/gateway"
 	"reimagined-chainsaw/infrastructure/rabbitmq"
+	"reimagined-chainsaw/infrastructure/storage"
+	"strings"
 	"time"
 )
 
+var ErrUserUnauthorized = errors.New("user unauthorized")
+
 type Server struct {
-	ginEngine      *gin.Engine
-	melody         *melody.Melody
+	mux            *http.ServeMux
+	melodySessions map[string]*manager.WebSocketManager
 	messageCh      chan string
-	rabbitmqClient rabbitmq.Client
+	rabbitmqClient gateway.RabbitMQClient
+	storage        gateway.Db
 }
 
 func NewServer() *Server {
 	rc := rabbitmq.Client{
-		URL:                "xpto",
-		PublisherQueueName: "find_stock_price",
-		ConsumerQueueName:  "stock_price",
+		URL:                rabbitmq.LocalInstanceRabbitURL,
+		PublisherQueueName: rabbitmq.FindStockPriceQueueName,
+		ConsumerQueueName:  rabbitmq.StockPriceResultQueueName,
 	}
 
 	if err := rc.Connect(); err != nil {
@@ -31,62 +37,89 @@ func NewServer() *Server {
 	}
 
 	return &Server{
-		gin.Default(),
-		melody.New(),
+		http.NewServeMux(),
+		make(map[string]*manager.WebSocketManager),
 		make(chan string),
-		rc,
+		&rc,
+		storage.NewInMemoryStorage(),
 	}
 }
 
 func (s *Server) WithHandlers() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		urlQueryTokens := strings.Split(r.URL.RawQuery, "=")
+		channelName := urlQueryTokens[len(urlQueryTokens)-1]
+
+		s.melodySessions[channelName].HandleRequest(w, r)
+	})
+
+	s.mux.HandleFunc("/signin", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			http.ServeFile(w, r, "html/signin.html")
+			return
+
+		case "POST":
+			if err := r.ParseForm(); err != nil {
+				log.Println(err)
+				return
+			}
+
+			if err := s.authorizeUser(r.FormValue("user"), r.FormValue("password")); err != nil {
+				log.Println(err)
+				http.ServeFile(w, r, "html/signin.html")
+				return
+			}
+
+			http.ServeFile(w, r, "html/index.html")
+			return
+		}
+	})
+
+	s.mux.HandleFunc("/create", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			http.ServeFile(w, r, "html/signup.html")
+			return
+
+		case "POST":
+			if err := r.ParseForm(); err != nil {
+				log.Println(err)
+				return
+			}
+
+			if err := s.storage.AddNewUser(r.FormValue("user"), r.FormValue("password")); err != nil {
+				log.Println(err)
+				http.ServeFile(w, r, "html/signin.html")
+				return
+			}
+
+			http.ServeFile(w, r, "html/index.html")
+			return
+		}
+	})
+
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			http.ServeFile(w, r, "index.html")
+			http.ServeFile(w, r, "html/signup.html")
 			return
 		}
 
-		http.ServeFile(w, r, "chan.html")
-	})
+		urlPathTokens := strings.Split(r.URL.Path, "/")
+		channelName := urlPathTokens[len(urlPathTokens)-1]
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		s.melody.HandleRequest(w, r)
-	})
-
-	//s.ginEngine.GET("/", func(c *gin.Context) {
-	//	http.ServeFile(c.Writer, c.Request, "index.html")
-	//	return
-	//})
-	//
-	//s.ginEngine.GET("/channel", func(c *gin.Context) {
-	//	http.ServeFile(c.Writer, c.Request, "chan.html")
-	//	return
-	//})
-	//
-	//s.ginEngine.GET("/ws", func(c *gin.Context) {
-	//	err := s.melody.HandleRequest(c.Writer, c.Request)
-	//	if err != nil {
-	//		panic(err)
-	//	}
-	//})
-}
-
-func (s *Server) SetHandleMessage() {
-	s.melody.HandleMessage(func(session *melody.Session, msg []byte) {
-		_ = s.melody.BroadcastFilter(msg, func(q *melody.Session) bool {
-			return q.Request.URL.Path == session.Request.URL.Path
-		})
-
-		msgAsString := string(msg)
-
-		pattern := `\/stock=([a-zA-Z0-9_.]+)`
-		regex := regexp.MustCompile(pattern)
-		match := regex.FindStringSubmatch(msgAsString)
-		if len(match) > 1 {
-			err := s.rabbitmqClient.PublishMessage(context.Background(), match[1])
-			if err != nil {
-				log.Println(err)
+		m, exist := s.melodySessions[channelName]
+		if !exist {
+			s.melodySessions[channelName] = &manager.WebSocketManager{
+				ConnID:         channelName,
+				Melody:         melody.New(),
+				RabbitMQClient: s.rabbitmqClient,
 			}
+			m = s.melodySessions[channelName]
 		}
+		m.SetHandleMessage()
+
+		http.ServeFile(w, r, "html/channel.html")
 	})
 }
 
@@ -100,20 +133,40 @@ func (s *Server) RunCallbackFn() {
 		for {
 			select {
 			case c := <-ch:
-				_ = s.melody.BroadcastFilter(c.Body, func(q *melody.Session) bool {
+				tokens := strings.Split(string(c.Body), ":")
+				channelID := tokens[0]
+				messageTemplate := "%s quote is $%s per share"
+				_ = s.melodySessions[channelID].BroadcastFilter([]byte(fmt.Sprintf(messageTemplate, tokens[1], tokens[2])), func(q *melody.Session) bool {
 					return q.Request.URL.Path == q.Request.URL.Path
 				})
 			default:
-				time.Sleep(5 * time.Second)
+				time.Sleep(10 * time.Second)
 			}
 		}
 	}(msgCh)
 }
 
 func (s *Server) Start() {
-	//err := s.ginEngine.Run(":5000")
-	//if err != nil {
-	//	panic(err)
-	//}
-	http.ListenAndServe(":5000", nil)
+	err := http.ListenAndServe(":5000", s.mux)
+	if err != nil {
+		defer s.Close()
+		panic(err)
+	}
+}
+
+func (s *Server) Close() {
+	s.rabbitmqClient.Close()
+}
+
+func (s *Server) authorizeUser(username, pw string) error {
+	p, err := s.storage.FindUserPassword(username)
+	if err != nil {
+		return err
+	}
+
+	if p != pw {
+		return ErrUserUnauthorized
+	}
+
+	return nil
 }

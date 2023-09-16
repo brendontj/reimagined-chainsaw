@@ -5,6 +5,12 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+const (
+	LocalInstanceRabbitURL    = "amqp://guest:guest@localhost:5672/"
+	StockPriceResultQueueName = "stock_price"
+	FindStockPriceQueueName   = "find_stock_price"
+)
+
 type Client struct {
 	URL                string
 	PublisherQueueName string
@@ -16,8 +22,7 @@ type Client struct {
 }
 
 func (c *Client) Connect() error {
-	//Todo: Change it to put this value in a env file
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	conn, err := amqp.Dial(c.URL)
 	if err != nil {
 		return err
 	}
@@ -58,10 +63,8 @@ func (c *Client) ConsumeMessages() (<-chan amqp.Delivery, error) {
 }
 
 func (c *Client) Close() {
-	defer func() {
-		_ = c.channel.Close()
-		_ = c.conn.Close()
-	}()
+	_ = c.channel.Close()
+	_ = c.conn.Close()
 }
 
 func (c *Client) openChannels() error {
