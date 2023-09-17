@@ -147,7 +147,7 @@ func (s *Server) RunCallbackFn() {
 }
 
 func (s *Server) Start() {
-	err := http.ListenAndServe(":5000", s.mux)
+	err := http.ListenAndServe(":8000", s.mux)
 	if err != nil {
 		defer s.Close()
 		panic(err)
